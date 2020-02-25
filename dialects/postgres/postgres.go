@@ -2,92 +2,80 @@ package postgres
 
 import (
 	"database/sql"
-	"fmt"
-	"regexp"
-	"strconv"
+	"database/sql/driver"
 
-	"github.com/jinzhu/gorm"
-	"github.com/jinzhu/gorm/callbacks"
-	"github.com/jinzhu/gorm/logger"
-	"github.com/jinzhu/gorm/migrator"
-	"github.com/jinzhu/gorm/schema"
+	"encoding/json"
+	"errors"
+	"fmt"
+
 	_ "github.com/lib/pq"
+	"github.com/lib/pq/hstore"
 )
 
-type Dialector struct {
-	DSN string
-}
+type Hstore map[string]*string
 
-func Open(dsn string) gorm.Dialector {
-	return &Dialector{DSN: dsn}
-}
-
-func (dialector Dialector) Initialize(db *gorm.DB) (err error) {
-	// register callbacks
-	callbacks.RegisterDefaultCallbacks(db)
-
-	db.DB, err = sql.Open("postgres", dialector.DSN)
-	return
-}
-
-func (dialector Dialector) Migrator(db *gorm.DB) gorm.Migrator {
-	return Migrator{migrator.Migrator{Config: migrator.Config{
-		DB:                          db,
-		Dialector:                   dialector,
-		CreateIndexAfterCreateTable: true,
-	}}}
-}
-
-func (dialector Dialector) BindVar(stmt *gorm.Statement, v interface{}) string {
-	return "$" + strconv.Itoa(len(stmt.Vars))
-}
-
-func (dialector Dialector) QuoteChars() [2]byte {
-	return [2]byte{'"', '"'} // "name"
-}
-
-var numericPlaceholder = regexp.MustCompile("\\$(\\d+)")
-
-func (dialector Dialector) Explain(sql string, vars ...interface{}) string {
-	return logger.ExplainSQL(sql, numericPlaceholder, `'`, vars...)
-}
-
-func (dialector Dialector) DataTypeOf(field *schema.Field) string {
-	switch field.DataType {
-	case schema.Bool:
-		return "boolean"
-	case schema.Int, schema.Uint:
-		if field.AutoIncrement {
-			switch {
-			case field.Size < 16:
-				return "smallserial"
-			case field.Size < 31:
-				return "serial"
-			default:
-				return "bigserial"
-			}
-		} else {
-			switch {
-			case field.Size < 16:
-				return "smallint"
-			case field.Size < 31:
-				return "integer"
-			default:
-				return "bigint"
-			}
-		}
-	case schema.Float:
-		return "decimal"
-	case schema.String:
-		if field.Size > 0 {
-			return fmt.Sprintf("varchar(%d)", field.Size)
-		}
-		return "text"
-	case schema.Time:
-		return "timestamp with time zone"
-	case schema.Bytes:
-		return "bytea"
+// Value get value of Hstore
+func (h Hstore) Value() (driver.Value, error) {
+	hstore := hstore.Hstore{Map: map[string]sql.NullString{}}
+	if len(h) == 0 {
+		return nil, nil
 	}
 
-	return ""
+	for key, value := range h {
+		var s sql.NullString
+		if value != nil {
+			s.String = *value
+			s.Valid = true
+		}
+		hstore.Map[key] = s
+	}
+	return hstore.Value()
+}
+
+// Scan scan value into Hstore
+func (h *Hstore) Scan(value interface{}) error {
+	hstore := hstore.Hstore{}
+
+	if err := hstore.Scan(value); err != nil {
+		return err
+	}
+
+	if len(hstore.Map) == 0 {
+		return nil
+	}
+
+	*h = Hstore{}
+	for k := range hstore.Map {
+		if hstore.Map[k].Valid {
+			s := hstore.Map[k].String
+			(*h)[k] = &s
+		} else {
+			(*h)[k] = nil
+		}
+	}
+
+	return nil
+}
+
+// Jsonb Postgresql's JSONB data type
+type Jsonb struct {
+	json.RawMessage
+}
+
+// Value get value of Jsonb
+func (j Jsonb) Value() (driver.Value, error) {
+	if len(j.RawMessage) == 0 {
+		return nil, nil
+	}
+	return j.MarshalJSON()
+}
+
+// Scan scan value into Jsonb
+func (j *Jsonb) Scan(value interface{}) error {
+	bytes, ok := value.([]byte)
+	if !ok {
+		return errors.New(fmt.Sprint("Failed to unmarshal JSONB value:", value))
+	}
+
+	return json.Unmarshal(bytes, j)
 }
